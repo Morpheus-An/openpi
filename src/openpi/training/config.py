@@ -284,7 +284,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
     comments below.
     """
-
+    #TODO: Curate my own dataset.
     extra_delta_transform: bool = False
 
     @override
@@ -749,7 +749,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/mars_data/ant/openpi/checkpoints/pi05_libero/torch_checkpoints",
         num_train_steps=30_000,
     ),
     #

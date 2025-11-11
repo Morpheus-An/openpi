@@ -46,6 +46,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
+import pdb
 
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -526,6 +527,7 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
+            # TODO
             losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):

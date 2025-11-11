@@ -127,6 +127,7 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
+    ## TODO: 上面是model observation接受的东西
 
     def to_dict(self) -> at.PyTree[ArrayT]:
         """Convert the Observation to a nested dict."""
