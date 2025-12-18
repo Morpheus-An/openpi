@@ -125,6 +125,7 @@ def set_seed(seed: int, local_rank: int):
 
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
+    # pdb.set_trace()
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
 
@@ -311,7 +312,6 @@ def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
-
     # Initialize checkpoint directory and wandb
     resuming = False
     if config.resume:
@@ -389,6 +389,7 @@ def train_loop(config: _config.TrainConfig):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
+    # pdb.set_trace()
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
@@ -406,8 +407,39 @@ def train_loop(config: _config.TrainConfig):
         model_cfg = config.model
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
+    # TODO: 仔细弄懂模型的加载和定义，重点是弄懂 lora 是如何根据配置进行加载的
+    # Debug: Check config before model creation
+    if is_main:
+        logging.info(f"Model config - paligemma_variant: {model_cfg.paligemma_variant}, action_expert_variant: {model_cfg.action_expert_variant}")
+        # Check if LoRA configs are present (use PyTorch version of gemma config)
+        from openpi.models_pytorch import gemma_config as _gemma_pytorch
+        paligemma_config = _gemma_pytorch.get_config(model_cfg.paligemma_variant)
+        action_expert_config = _gemma_pytorch.get_config(model_cfg.action_expert_variant)
+        logging.info(f"Paligemma config has lora_configs: {hasattr(paligemma_config, 'lora_configs') and paligemma_config.lora_configs is not None}")
+        logging.info(f"Action expert config has lora_configs: {hasattr(action_expert_config, 'lora_configs') and action_expert_config.lora_configs is not None}")
+        if hasattr(action_expert_config, 'lora_configs') and action_expert_config.lora_configs is not None:
+            logging.info(f"Action expert lora_configs: {action_expert_config.lora_configs}")
+    
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    
+    # Debug: Check if LoRA layers were created
+    if is_main:
+        model_to_check = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        lora_params_after_creation = [name for name, _ in model_to_check.named_parameters() if "lora_A" in name or "lora_B" in name]
+        if lora_params_after_creation:
+            logging.info(f"Found {len(lora_params_after_creation)} LoRA parameters after model creation: {lora_params_after_creation[:3]}...")
+        else:
+            logging.warning("No LoRA parameters found after model creation! Checking layer types...")
+            if hasattr(model_to_check, 'paligemma_with_expert'):
+                first_layer = model_to_check.paligemma_with_expert.gemma_expert.model.layers[0]
+                logging.warning(f"q_proj type: {type(first_layer.self_attn.q_proj)}")
+                logging.warning(f"gate_proj type: {type(first_layer.mlp.gate_proj)}")
+                # Check if it's LoRALinear
+                from openpi.models_pytorch.lora import LoRALinear
+                if isinstance(first_layer.self_attn.q_proj, LoRALinear):
+                    logging.warning(f"q_proj is LoRALinear but has no lora_A/lora_B parameters!")
+                    logging.warning(f"q_proj.lora_A: {first_layer.self_attn.q_proj.lora_A}")
+                    logging.warning(f"q_proj.lora_B: {first_layer.self_attn.q_proj.lora_B}")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -444,10 +476,181 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        
+        # Check for LoRA parameters before loading weights
+        lora_params_before = [name for name, _ in model_to_load.named_parameters() if "lora_A" in name or "lora_B" in name]
+        if lora_params_before:
+            logging.info(f"Found {len(lora_params_before)} LoRA parameters before loading weights: {lora_params_before[:5]}...")
+        else:
+            logging.warning("No LoRA parameters found before loading weights! Model may not have LoRA layers.")
+            # Debug: Check layer types
+            if hasattr(model_to_load, 'paligemma_with_expert'):
+                first_layer = model_to_load.paligemma_with_expert.gemma_expert.model.layers[0]
+                logging.warning(f"q_proj type: {type(first_layer.self_attn.q_proj)}")
+                logging.warning(f"gate_proj type: {type(first_layer.mlp.gate_proj)}")
+        
+        # Load checkpoint and remap keys for LoRA compatibility
+        # When using LoRALinear, the weight key changes from 'xxx.weight' to 'xxx.base_layer.weight'
+        # We need to remap checkpoint keys to match the model's expected keys
+        checkpoint_state_dict = safetensors.torch.load_file(model_path)
+        model_state_dict = model_to_load.state_dict()
+        
+        # Build a mapping from checkpoint keys to model keys
+        remapped_state_dict = {}
+        matched_count = 0
+        remapped_count = 0
+        skipped_keys = []
+        
+        for ckpt_key, ckpt_value in checkpoint_state_dict.items():
+            if ckpt_key in model_state_dict:
+                # Direct match
+                remapped_state_dict[ckpt_key] = ckpt_value
+                matched_count += 1
+            else:
+                # Try to remap: xxx.weight -> xxx.base_layer.weight (for LoRALinear)
+                # This handles the case where checkpoint has nn.Linear but model has LoRALinear
+                if ckpt_key.endswith('.weight') or ckpt_key.endswith('.bias'):
+                    # Split the key into prefix and suffix
+                    parts = ckpt_key.rsplit('.', 1)
+                    if len(parts) == 2:
+                        prefix, suffix = parts
+                        remapped_key = f"{prefix}.base_layer.{suffix}"
+                        if remapped_key in model_state_dict:
+                            remapped_state_dict[remapped_key] = ckpt_value
+                            remapped_count += 1
+                            continue
+                skipped_keys.append(ckpt_key)
+        
+        logging.info(f"Checkpoint loading: {matched_count} direct matches, {remapped_count} remapped (LoRA base_layer), {len(skipped_keys)} skipped")
+        if skipped_keys and len(skipped_keys) <= 10:
+            logging.info(f"Skipped keys: {skipped_keys}")
+        elif skipped_keys:
+            logging.info(f"Skipped keys (first 10): {skipped_keys[:10]}...")
+        
+        # Load the remapped state dict
+        missing_keys, unexpected_keys = model_to_load.load_state_dict(remapped_state_dict, strict=False)
+        
+        # Log any issues
+        if missing_keys:
+            # Filter out LoRA keys from missing keys (they are expected to be missing from base checkpoint)
+            non_lora_missing = [k for k in missing_keys if 'lora_A' not in k and 'lora_B' not in k]
+            if non_lora_missing:
+                logging.warning(f"Missing non-LoRA keys after loading: {len(non_lora_missing)}")
+                if len(non_lora_missing) <= 10:
+                    logging.warning(f"Missing keys: {non_lora_missing}")
+                else:
+                    logging.warning(f"Missing keys (first 10): {non_lora_missing[:10]}...")
+        
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        
+        # Check for LoRA parameters after loading weights
+        lora_params_after = [name for name, _ in model_to_load.named_parameters() if "lora_A" in name or "lora_B" in name]
+        if lora_params_after:
+            logging.info(f"Found {len(lora_params_after)} LoRA parameters after loading weights")
+        else:
+            logging.warning("No LoRA parameters found after loading weights!")
+
+
+    # Freeze parameters for LoRA fine-tuning if configured
+    use_lora = False
+    paligemma_variant = getattr(config.model, 'paligemma_variant', None)
+    action_expert_variant = getattr(config.model, 'action_expert_variant', None)
+    
+    if paligemma_variant and "lora" in paligemma_variant:
+        use_lora = True
+    if action_expert_variant and "lora" in action_expert_variant:
+        use_lora = True
+
+    if use_lora:
+        logging.info("LoRA fine-tuning detected. Freezing non-LoRA parameters...")
+        model_to_freeze = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        
+        # Determine which parts to freeze based on config
+        freeze_paligemma = paligemma_variant and "lora" in paligemma_variant
+        freeze_action_expert = action_expert_variant and "lora" in action_expert_variant
+        logging.info(f"Freeze paligemma: {freeze_paligemma}, freeze action expert: {freeze_action_expert}")
+        # Freeze all parameters first
+        for param in model_to_freeze.parameters():
+            param.requires_grad = False
+    
+        # Unfreeze LoRA parameters and other non-frozen components
+        lora_param_count = 0
+        lora_param_numel = 0
+        unfrozen_param_count = 0
+        unfrozen_param_numel = 0
+        
+        for name, param in model_to_freeze.named_parameters():
+            # LoRA parameters are named with "lora_A" or "lora_B"
+            if "lora_A" in name or "lora_B" in name:
+                param.requires_grad = True
+                lora_param_count += 1
+                lora_param_numel += param.numel()
+                continue
+            
+            # IMPORTANT: Skip base_layer parameters in LoRALinear - they should stay frozen
+            # when using LoRA fine-tuning
+            if "base_layer" in name:
+                # Keep frozen for LoRA layers
+                continue
+            
+            # Always unfreeze action projection layers (not part of gemma)
+            # These should be checked before gemma_expert checks to avoid conflicts
+            if "action_in_proj" in name or "action_out_proj" in name:
+                param.requires_grad = True
+                unfrozen_param_count += 1
+                unfrozen_param_numel += param.numel()
+                continue
+            
+            if "state_proj" in name or "action_time_mlp" in name or "time_mlp" in name:
+                param.requires_grad = True
+                unfrozen_param_count += 1
+                unfrozen_param_numel += param.numel()
+                continue
+            
+            # If paligemma should not be frozen, unfreeze its non-LoRA params
+            # Check this before action_expert to avoid conflicts
+            if (not freeze_paligemma) and ("paligemma" in name or "language_model" in name):
+                param.requires_grad = True
+                unfrozen_param_count += 1
+                unfrozen_param_numel += param.numel()
+                continue
+            
+            # If action_expert should not be frozen, unfreeze its non-LoRA params
+            # Only unfreeze gemma_expert params, not other "action" params (those are handled above)
+            if (not freeze_action_expert) and "gemma_expert" in name:
+                param.requires_grad = True
+                unfrozen_param_count += 1
+                unfrozen_param_numel += param.numel()
+                continue
+        
+        logging.info(f"Found {lora_param_count} LoRA parameter tensors ({lora_param_numel:,} elements), {unfrozen_param_count} other unfrozen tensors ({unfrozen_param_numel:,} elements)")
+        
+        # Count trainable parameters by category
+        lora_trainable = sum(p.numel() for n, p in model_to_freeze.named_parameters() if p.requires_grad and ("lora_A" in n or "lora_B" in n))
+        other_trainable = sum(p.numel() for n, p in model_to_freeze.named_parameters() if p.requires_grad and not ("lora_A" in n or "lora_B" in n))
+        trainable_params = lora_trainable + other_trainable
+        total_params = sum(p.numel() for p in model_to_freeze.parameters())
+        
+        logging.info(f"Trainable breakdown: LoRA={lora_trainable:,}, Other={other_trainable:,}")
+        logging.info(f"LoRA fine-tuning: {trainable_params:,} trainable parameters out of {total_params:,} total ({100 * trainable_params / total_params:.2f}%)")
+        
+        # Debug: Print some example parameter names if unexpected
+        if other_trainable > trainable_params * 0.5:  # If other params are >50% of trainable
+            logging.warning(f"WARNING: Non-LoRA parameters ({other_trainable:,}) make up {100 * other_trainable / trainable_params:.1f}% of trainable params")
+            sample_names = []
+            for name, param in model_to_freeze.named_parameters():
+                if param.requires_grad and not ("lora_A" in name or "lora_B" in name):
+                    sample_names.append(name)
+                if len(sample_names) >= 10:
+                    break
+            if sample_names:
+                logging.warning(f"Sample non-LoRA trainable parameters: {sample_names[:5]}")
+    else:
+        total_params = sum(p.numel() for p in model.parameters())
+       
+        logging.info("Full fine-tuning mode: all parameters are trainable")
+        logging.info(f"Total parameters: {total_params:,}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -456,8 +659,10 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    # Filter to only include trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

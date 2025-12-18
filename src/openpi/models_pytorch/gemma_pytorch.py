@@ -9,6 +9,13 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
 
+def _get_layer_weight(layer):
+    """Get weight from layer, handling both nn.Linear and LoRALinear."""
+    if hasattr(layer, 'base_layer'):
+        return layer.base_layer.weight
+    return layer.weight
+
+
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -35,10 +42,43 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
+        
+        # Pass LoRA configs to vlm config if available
+        if hasattr(vlm_config, 'lora_configs') and vlm_config.lora_configs is not None:
+            # Convert LoRAConfig objects to dict format for serialization
+            lora_configs_dict = {}
+            for key, lora_cfg in vlm_config.lora_configs.items():
+                if hasattr(lora_cfg, 'rank'):
+                    lora_configs_dict[key] = {
+                        "rank": lora_cfg.rank,
+                        "alpha": lora_cfg.alpha,
+                        "rslora": lora_cfg.rslora,
+                    }
+                else:
+                    # Already a dict
+                    lora_configs_dict[key] = lora_cfg
+            vlm_config_hf.text_config.lora_configs = lora_configs_dict
+        
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
+
+        # Prepare LoRA configs for action expert if available
+        action_expert_lora_configs = None
+        if hasattr(action_expert_config, 'lora_configs') and action_expert_config.lora_configs is not None:
+            # Convert LoRAConfig objects to dict format for serialization
+            action_expert_lora_configs = {}
+            for key, lora_cfg in action_expert_config.lora_configs.items():
+                if hasattr(lora_cfg, 'rank'):
+                    action_expert_lora_configs[key] = {
+                        "rank": lora_cfg.rank,
+                        "alpha": lora_cfg.alpha,
+                        "rslora": lora_cfg.rslora,
+                    }
+                else:
+                    # Already a dict
+                    action_expert_lora_configs[key] = lora_cfg
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -52,6 +92,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             torch_dtype="float32",
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            lora_configs=action_expert_lora_configs,
         )
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
@@ -217,8 +258,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                     layer = models[i].layers[layer_idx]
                     end_pos = start_pos + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    o_proj_weight = _get_layer_weight(layer.self_attn.o_proj)
+                    if att_output.dtype != o_proj_weight.dtype:
+                        att_output = att_output.to(o_proj_weight.dtype)
                     out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
 
                     # first residual
@@ -226,7 +268,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
                     # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                    up_proj_weight = _get_layer_weight(layer.mlp.up_proj)
+                    if up_proj_weight.dtype == torch.bfloat16:
                         out_emb = out_emb.to(dtype=torch.bfloat16)
 
                     out_emb = layer.mlp(out_emb)

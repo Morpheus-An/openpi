@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pdb
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -60,6 +61,51 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class FilteredDataset(Dataset[T_co]):
+    """Dataset wrapper that filters out None values from transformed data."""
+
+    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+        self._dataset = dataset
+        self._transform = _transforms.compose(transforms)
+        # Pre-compute valid indices by checking which samples pass the filter
+        self._valid_indices = self._compute_valid_indices()
+
+    def _compute_valid_indices(self) -> list[int]:
+        """Compute which indices pass the filter."""
+        valid_indices = []
+        total = len(self._dataset)
+        # Log progress for large datasets
+        # log_interval = max(1, total // 20)  # Log ~20 times
+        log_interval = 1
+        for i in range(total):
+            if i % log_interval == 0:
+                logging.info(f"Filtering dataset: {i}/{total} samples processed, {len(valid_indices)} passed filter")
+            try:
+                transformed = self._transform(self._dataset[i])
+                if transformed is not None:
+                    valid_indices.append(i)
+            except Exception:
+                # Skip samples that cause errors during transformation
+                continue
+        
+        logging.info(f"Filtering complete: {len(valid_indices)}/{total} samples passed filter")
+        return valid_indices
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        # Map the filtered index to the original dataset index
+        original_index = self._valid_indices[index.__index__()]
+        # Get the original data and transform it
+        # We already verified this index passes the filter, so result should not be None
+        result = self._transform(self._dataset[original_index])
+        if result is None:
+            # This should not happen if _compute_valid_indices worked correctly
+            raise ValueError(f"Filtered sample at index {index} (original {original_index}) returned None")
+        return result
+
+    def __len__(self) -> int:
+        return len(self._valid_indices)
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -144,6 +190,17 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    # pdb.set_trace()
+    # Apply task suite filtering if specified (before prompt_from_task to preserve task_index)
+    if data_config.task_suite is not None:
+        logging.info(f"Filtering dataset by task suite: {data_config.task_suite}")
+        filter_transform = _transforms.FilterByTaskSuite(
+            task_suite=data_config.task_suite,
+        )
+        original_size = len(dataset)
+        dataset = FilteredDataset(dataset, [filter_transform])
+        filtered_size = len(dataset)
+        logging.info(f"Filtered dataset size: {filtered_size} samples (from {original_size} total)")
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

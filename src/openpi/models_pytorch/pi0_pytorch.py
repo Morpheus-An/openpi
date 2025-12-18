@@ -7,8 +7,16 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+import openpi.models_pytorch.gemma_config as _gemma_pytorch
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+
+
+def _get_layer_weight(layer):
+    """Get weight from layer, handling both nn.Linear and LoRALinear."""
+    if hasattr(layer, 'base_layer'):
+        return layer.base_layer.weight
+    return layer.weight
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -87,8 +95,9 @@ class PI0Pytorch(nn.Module):
         self.config = config
         self.pi05 = config.pi05
 
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
-        action_expert_config = _gemma.get_config(config.action_expert_variant)
+        # Use PyTorch version of gemma config to get PyTorch LoRAConfig instead of JAX version
+        paligemma_config = _gemma_pytorch.get_config(config.paligemma_variant)
+        action_expert_config = _gemma_pytorch.get_config(config.action_expert_variant)
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
@@ -241,7 +250,8 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         if not self.pi05:
-            if self.state_proj.weight.dtype == torch.float32:
+            state_proj_weight = _get_layer_weight(self.state_proj)
+            if state_proj_weight.dtype == torch.float32:
                 state = state.to(torch.float32)
 
             # Embed state
@@ -329,10 +339,10 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
+        
+        # Get dtype from first layer's q_proj (handle both nn.Linear and LoRALinear)
+        q_proj_weight = _get_layer_weight(self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj)
+        if q_proj_weight.dtype == torch.bfloat16:
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 

@@ -19,7 +19,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import Optional, Dict, Any
 from ...configuration_utils import PretrainedConfig
 
 
@@ -85,6 +85,9 @@ class GemmaConfig(PretrainedConfig):
             Whether to use ADARMS.
         adarms_cond_dim (`int`, *optional*, defaults to `None`):
             The dimension of the ADARMS condition.
+        lora_configs (`dict`, *optional*, defaults to `None`):
+            LoRA configuration dictionary. Should contain keys like "attn" and "ffn" with LoRA config values.
+            Each value should be a dict with keys: "rank", "alpha", "rslora".
     ```python
     >>> from transformers import GemmaModel, GemmaConfig
     >>> # Initializing a Gemma gemma-7b style configuration
@@ -136,6 +139,7 @@ class GemmaConfig(PretrainedConfig):
         attention_dropout=0.0,
         use_adarms: bool = False,
         adarms_cond_dim: Optional[int] = None,
+        lora_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -156,6 +160,7 @@ class GemmaConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.use_adarms = use_adarms
         self.adarms_cond_dim = adarms_cond_dim
+        self.lora_configs = lora_configs
 
         # Set default for adarms_cond_dim if use_adarms is True
         if self.use_adarms and self.adarms_cond_dim is None:

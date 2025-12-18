@@ -42,6 +42,21 @@ from ...processing_utils import Unpack
 from ...utils import LossKwargs, auto_docstring, can_return_tuple, logging
 from .configuration_gemma import GemmaConfig
 
+# Import LoRA modules if available
+try:
+    from openpi.models_pytorch.lora import LoRALinear, LoRAConfig
+except ImportError:
+    # Fallback if LoRA is not available
+    LoRALinear = None
+    LoRAConfig = None
+
+
+def _get_layer_weight(layer):
+    """Get weight from layer, handling both nn.Linear and LoRALinear."""
+    if hasattr(layer, 'base_layer'):
+        return layer.base_layer.weight
+    return layer.weight
+
 
 logger = logging.get_logger(__name__)
 
@@ -116,9 +131,27 @@ class GemmaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        
+        # Get LoRA config for FFN if available
+        lora_config = None
+        if hasattr(config, 'lora_configs') and config.lora_configs is not None:
+            ffn_lora = config.lora_configs.get("ffn") if hasattr(config.lora_configs, 'get') else config.lora_configs.get("ffn", None)
+            if ffn_lora is not None and LoRAConfig is not None:
+                lora_config = LoRAConfig(
+                    rank=ffn_lora.get("rank", 16) if hasattr(ffn_lora, 'get') else getattr(ffn_lora, "rank", 16),
+                    alpha=ffn_lora.get("alpha", 1.0) if hasattr(ffn_lora, 'get') else getattr(ffn_lora, "alpha", 1.0),
+                    rslora=ffn_lora.get("rslora", False) if hasattr(ffn_lora, 'get') else getattr(ffn_lora, "rslora", False),
+                )
+        
+        # Create linear layers with or without LoRA
+        if lora_config is not None and LoRALinear is not None:
+            self.gate_proj = LoRALinear(self.hidden_size, self.intermediate_size, bias=False, lora_config=lora_config)
+            self.up_proj = LoRALinear(self.hidden_size, self.intermediate_size, bias=False, lora_config=lora_config)
+            self.down_proj = LoRALinear(self.intermediate_size, self.hidden_size, bias=False, lora_config=lora_config)
+        else:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -266,18 +299,48 @@ class GemmaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
+        # Get LoRA config for attention if available
+        lora_config = None
+        if hasattr(config, 'lora_configs') and config.lora_configs is not None:
+            attn_lora = config.lora_configs.get("attn") if hasattr(config.lora_configs, 'get') else config.lora_configs.get("attn", None)
+            if attn_lora is not None and LoRAConfig is not None:
+                lora_config = LoRAConfig(
+                    rank=attn_lora.get("rank", 16) if hasattr(attn_lora, 'get') else getattr(attn_lora, "rank", 16),
+                    alpha=attn_lora.get("alpha", 1.0) if hasattr(attn_lora, 'get') else getattr(attn_lora, "alpha", 1.0),
+                    rslora=attn_lora.get("rslora", False) if hasattr(attn_lora, 'get') else getattr(attn_lora, "rslora", False),
+                )
+        
+        # Create linear layers with or without LoRA
+        if lora_config is not None and LoRALinear is not None:
+            self.q_proj = LoRALinear(
+                config.hidden_size, config.num_attention_heads * self.head_dim, 
+                bias=config.attention_bias, lora_config=lora_config
+            )
+            self.k_proj = LoRALinear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, 
+                bias=config.attention_bias, lora_config=lora_config
+            )
+            self.v_proj = LoRALinear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, 
+                bias=config.attention_bias, lora_config=lora_config
+            )
+            self.o_proj = LoRALinear(
+                config.num_attention_heads * self.head_dim, config.hidden_size, 
+                bias=config.attention_bias, lora_config=lora_config
+            )
+        else:
+            self.q_proj = nn.Linear(
+                config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.k_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.v_proj = nn.Linear(
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            )
+            self.o_proj = nn.Linear(
+                config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            )
 
     def forward(
         self,
@@ -406,6 +469,11 @@ class GemmaPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
+        elif LoRALinear is not None and isinstance(module, LoRALinear):
+            # For LoRALinear, only initialize base_layer (LoRA params have their own init)
+            module.base_layer.weight.data.normal_(mean=0.0, std=std)
+            if module.base_layer.bias is not None:
+                module.base_layer.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
@@ -502,9 +570,11 @@ class GemmaModel(GemmaPreTrainedModel):
 
         # embed positions
         hidden_states = inputs_embeds
-        # Convert to bfloat16 if the first layer uses bfloat16
-        if len(self.layers) > 0 and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            hidden_states = hidden_states.to(torch.bfloat16)
+        # Convert to bfloat16 if the first layer uses bfloat16 (handle LoRALinear)
+        if len(self.layers) > 0:
+            q_proj_weight = _get_layer_weight(self.layers[0].self_attn.q_proj)
+            if q_proj_weight.dtype == torch.bfloat16:
+                hidden_states = hidden_states.to(torch.bfloat16)
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

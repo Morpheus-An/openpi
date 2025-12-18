@@ -89,6 +89,9 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Task suite to filter by (e.g., "libero_spatial"). If None, no filtering is applied.
+    task_suite: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -286,6 +289,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
     #TODO: Curate my own dataset.
     extra_delta_transform: bool = False
+    # Task suite to filter by (e.g., "libero_spatial"). If None, uses all tasks.
+    task_suite: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -351,6 +356,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("actions",),
+            task_suite=self.task_suite,
         )
 
 
@@ -650,7 +657,7 @@ _CONFIGS = [
         # dataset. For your own dataset, you can change the repo_id to point to your dataset.
         # Also modify the DataConfig to use the new config you made for your dataset above.
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="physical-intelligence/libero_spatial",
             base_config=DataConfig(
                 # This flag determines whether we load the prompt (i.e. the task instruction) from the
                 # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
@@ -661,31 +668,59 @@ _CONFIGS = [
         ),
         # Here you define which pre-trained checkpoint you want to load to initialize the model.
         # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/mars_data_2/.cache/openpi/openpi-assets/checkpoints/pi0_base_pytorch",
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
-        num_train_steps=30_000,
+        num_train_steps=5000,
+
     ),
     TrainConfig(
+        batch_size=8,
         name="pi0_libero_low_mem_finetune",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        # Here is an example of loading a pi0 model for LoRA fine-tuning (JAX version).
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m"),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="physical-intelligence/libero_spatial",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mars_data_2/ant/openpi/checkpoints/pi0_libero_low_mem_finetune/1212pi0_libero_spatial_lora_jax/29999/params"),
         num_train_steps=30_000,
         # The freeze filter defines which parameters should be frozen during training.
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
         freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+    ),
+    TrainConfig(
+        batch_size=8,
+        name="pi0_libero_lora_pytorch",
+        # PyTorch version of LoRA fine-tuning on Libero dataset.
+        # This config uses PyTorch checkpoint and automatically freezes non-LoRA parameters.
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero_spatial",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            task_suite=None,  # Filter to only use libero_spatial task suite
+        ),
+        # Use PyTorch checkpoint path instead of JAX weight_loader
+        # pytorch_weight_path="/mars_data_2/ant/openpi/checkpoints/pi0_libero_lora_pytorch/pi0_libero_spatial_lora_test/5000",
+        pytorch_weight_path="/mars_data_2/ant/openpi/checkpoints/pi0_libero_lora_pytorch/both_lora_toch_pi0_libero/12000",
+        # pytorch_weight_path="/mars_data_2/.cache/openpi/openpi-assets/checkpoints/pi0_base_pytorch/",
+        num_train_steps=30000,
+        # TODO：相应调整lr_schedule中的 decay_steps和 warmup_steps
+        # resume=True,
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        # Note: Parameter freezing is handled automatically in train_pytorch.py
+        # based on the LoRA variant names in the model config.
     ),
     TrainConfig(
         name="pi0_fast_libero",
@@ -739,7 +774,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=128,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,

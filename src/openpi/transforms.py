@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import pdb
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -335,6 +336,82 @@ class PadStatesAndActions(DataTransformFn):
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
+
+
+@dataclasses.dataclass(frozen=True)
+class FilterByTaskSuite(DataTransformFn):
+    """Filters data by task suite. Returns data if task matches, None otherwise.
+    
+    Note: This transform should be used with a dataset wrapper that filters out None values.
+    The task matching is done by comparing the task name (from dataset_meta.tasks) with
+    task names in the libero_task_map. The task name in the dataset may be a natural language
+    description, so we normalize it for matching.
+    """
+
+    # Task suite name (e.g., "libero_spatial")
+    task_suite: str
+
+    def __post_init__(self):
+        """Initialize cached task sets after dataclass initialization."""
+        # Import and cache libero task map
+        try:
+            from third_party.libero.libero.libero.benchmark.libero_suite_task_map import libero_task_map
+        except ImportError:
+            # Fallback: try alternative import path
+            try:
+                from libero.libero.benchmark.libero_suite_task_map import libero_task_map
+            except ImportError:
+                raise ImportError(
+                    "Could not import libero_task_map. Make sure libero is properly installed."
+                )
+        # Get tasks for the specified suite and normalize them
+        suite_tasks = libero_task_map.get(self.task_suite, [])
+        # Normalize task names: convert to lowercase and replace spaces/underscores
+        normalized_suite_tasks = {self._normalize_task_name(t) for t in suite_tasks}
+        # Also keep original for exact matching
+        suite_tasks_set = set(suite_tasks)
+        # Store as non-frozen attributes (using object.__setattr__ for frozen dataclass)
+        object.__setattr__(self, "_normalized_suite_tasks", normalized_suite_tasks)
+        object.__setattr__(self, "_suite_tasks_set", suite_tasks_set)
+
+    @staticmethod
+    def _normalize_task_name(task_name: str) -> str:
+        """Normalize task name for matching: lowercase, remove special chars, normalize spaces/underscores."""
+        # Convert to lowercase
+        normalized = task_name.lower()
+        # Replace underscores and multiple spaces with single space
+        normalized = normalized.replace("_", " ")
+        # Remove extra whitespace
+        normalized = " ".join(normalized.split())
+        return normalized
+
+    def __call__(self, data: DataDict) -> DataDict | None:
+        """Filter data by checking if task belongs to the specified task suite."""
+
+        if self.task_suite is None:
+            return data
+        
+        # Prefer the dataset-provided task field; fall back to task_name when present.
+        task_name = data.get("task") or data.get("task_name")
+        if not task_name:
+            # Without a task identifier we cannot filter; keep the sample.
+            return data
+
+        normalized_task = self._normalize_task_name(task_name)
+
+        # Fast exact match against normalized suite tasks.
+        if normalized_task in self._normalized_suite_tasks:
+            return data
+
+        # Fuzzy match: some suites (e.g., libero_10) store data task names without the
+        # scene prefix. Check whether the normalized data task is a substring/suffix of
+        # any normalized suite task.
+        for suite_task in self._normalized_suite_tasks:
+            if normalized_task in suite_task or suite_task in normalized_task:
+                return data
+
+        # Not part of the requested suite.
+        return None
 
 
 def flatten_dict(tree: at.PyTree) -> dict:
